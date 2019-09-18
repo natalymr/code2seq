@@ -5,6 +5,7 @@ import time
 import numpy as np
 import shutil
 import tensorflow as tf
+from tensorflow.python import debug as tf_debug
 
 import reader
 from common import Common
@@ -17,6 +18,7 @@ class Model:
     def __init__(self, config):
         self.config = config
         self.sess = tf.Session()
+        # self.sess = tf_debug.LocalCLIDebugWrapperSession(self.sess)
 
         self.eval_queue = None
         self.predict_queue = None
@@ -78,6 +80,7 @@ class Model:
         self.print_hyperparams()
         print('Number of trainable params:',
               np.sum([np.prod(v.get_shape().as_list()) for v in tf.trainable_variables()]))
+
         self.initialize_session_variables(self.sess)
         print('Initalized variables')
         if self.config.LOAD_PATH:
@@ -304,15 +307,30 @@ class Model:
         print(throughput_message)
 
     def build_training_graph(self, input_tensors):
-        target_index = input_tensors[reader.TARGET_INDEX_KEY]
-        target_lengths = input_tensors[reader.TARGET_LENGTH_KEY]
+        # на одну размерность меньше
+        # (batch, max_target_parts + 1)
+        target_index        = input_tensors[reader.TARGET_INDEX_KEY]
+        # (batch, max_target_parts + 1)
+        target_lengths      = input_tensors[reader.TARGET_LENGTH_KEY]
+
+        # есть доп.размерность - про каждую из функций у коммита
+        # (batch, func,  max_contexts, max_name_parts) lookup для соурс
         path_source_indices = input_tensors[reader.PATH_SOURCE_INDICES_KEY]
-        node_indices = input_tensors[reader.NODE_INDICES_KEY]
+        # (batch, func,  max_contexts, max_path_length) lookup для нод
+        node_indices        = input_tensors[reader.NODE_INDICES_KEY]
+        # (batch, func,  max_contexts, max_name_parts) lookup для таргет
         path_target_indices = input_tensors[reader.PATH_TARGET_INDICES_KEY]
-        valid_context_mask = input_tensors[reader.VALID_CONTEXT_MASK_KEY]
+        # (batch, func,  max_contexts??) сколько "троек" не равны паддингу
+        valid_context_mask  = input_tensors[reader.VALID_CONTEXT_MASK_KEY]
+        # (batch, func, max_contexts) в соурсе, сколько не равны паддингу
         path_source_lengths = input_tensors[reader.PATH_SOURCE_LENGTHS_KEY]
-        path_lengths = input_tensors[reader.PATH_LENGTHS_KEY]
+        # (batch, func, max_contexts) в путях, сколько не равны паддингу
+        path_lengths        = input_tensors[reader.PATH_LENGTHS_KEY]
+        # (batch, func, max_contexts) в таргет, сколько не равны паддингу
         path_target_lengths = input_tensors[reader.PATH_TARGET_LENGTHS_KEY]
+
+        for key, value in input_tensors.items():
+            print(f"training: {key} {value}")
 
         with tf.variable_scope('model'):
             subtoken_vocab = tf.get_variable('SUBTOKENS_VOCAB',
@@ -333,16 +351,25 @@ class Model:
                                                                                                      mode='FAN_OUT',
                                                                                                      uniform=True))
             # (batch, max_contexts, decoder_size)
-            batched_contexts = self.compute_contexts(subtoken_vocab=subtoken_vocab, nodes_vocab=nodes_vocab,
-                                                     source_input=path_source_indices, nodes_input=node_indices,
+
+            # (batch, num function, max_contexts, decoder_size)
+            batched_contexts = self.compute_contexts(subtoken_vocab=subtoken_vocab,
+                                                     nodes_vocab=nodes_vocab,
+
+                                                     source_input=path_source_indices,
+                                                     nodes_input=node_indices,
                                                      target_input=path_target_indices,
                                                      valid_mask=valid_context_mask,
                                                      path_source_lengths=path_source_lengths,
-                                                     path_lengths=path_lengths, path_target_lengths=path_target_lengths)
+                                                     path_lengths=path_lengths,
+                                                     path_target_lengths=path_target_lengths)
 
             batch_size = tf.shape(target_index)[0]
             outputs, final_states = self.decode_outputs(target_words_vocab=target_words_vocab,
-                                                        target_input=target_index, batch_size=batch_size,
+
+                                                        target_input=target_index,
+                                                        batch_size=batch_size,
+                                                        # (batch, num function, max_contexts, decoder_size)
                                                         batched_contexts=batched_contexts,
                                                         valid_mask=valid_context_mask)
             step = tf.Variable(0, trainable=False)
@@ -371,20 +398,55 @@ class Model:
 
         return train_op, loss
 
-    def decode_outputs(self, target_words_vocab, target_input, batch_size, batched_contexts, valid_mask,
+    def decode_outputs(self, target_words_vocab,
+
+                       target_input,
+                       batch_size,
+                       # (batch, func, max_contexts, decoder_size)
+                       batched_contexts,
+                       # (batch, func, max_contexts)
+                       valid_mask,
                        is_evaluating=False):
+
+        # (batch, func)
         num_contexts_per_example = tf.count_nonzero(valid_mask, axis=-1)
 
+        # (batch, )
         start_fill = tf.fill([batch_size],
-                             self.target_to_index[Common.SOS])  # (batch, )
+                             self.target_to_index[Common.SOS])
         decoder_cell = tf.nn.rnn_cell.MultiRNNCell([
             tf.nn.rnn_cell.LSTMCell(self.config.DECODER_SIZE) for _ in range(self.config.NUM_DECODER_LAYERS)
         ])
-        contexts_sum = tf.reduce_sum(batched_contexts * tf.expand_dims(valid_mask, -1),
-                                     axis=1)  # (batch_size, dim * 2 + rnn_size)
-        contexts_average = tf.divide(contexts_sum, tf.to_float(tf.expand_dims(num_contexts_per_example, -1)))
-        fake_encoder_state = tuple(tf.nn.rnn_cell.LSTMStateTuple(contexts_average, contexts_average) for _ in
+        # СЖИМАЕМ ВСЕ ПУТИ В ОДИН;
+        # было  (batch_size, func, max_contexts, decoder_size)
+        # будет (batch_size, func, decoder_size)
+        contexts_sum = tf.reduce_sum(batched_contexts * tf.expand_dims(valid_mask, -1), # vm = (batch, func, max_contexts, 1)
+                                     axis=-2)  # (batch_size, func, decoder_size)
+        # (batch_size, func, decoder_size)
+        contexts_average = tf.divide(contexts_sum,
+                                     tf.to_float(tf.expand_dims(num_contexts_per_example, -1)) # ncpe = (batch, func, 1)
+                                     )
+
+        # MY SUPER-PUPER RNN starts HERE
+        function_count = tf.shape(batched_contexts)[1]
+        seq_length_batch = np.array([function_count])
+        basic_cell = tf.nn.rnn_cell.LSTMCell(num_units=self.config.DECODER_SIZE)
+        outputs, state = tf.nn.dynamic_rnn(cell=basic_cell,
+                                          inputs=contexts_average,
+                                          sequence_length=[function_count],
+                                          dtype=tf.float32)
+
+        final_avg_for_func = state.h  # (batch_size, decoder_size)
+        assert hasattr(state, "h")
+
+        # fake_encoder_state = tuple(tf.nn.rnn_cell.LSTMStateTuple(contexts_average, contexts_average) for _ in
+        #                            range(self.config.NUM_DECODER_LAYERS))
+
+        fake_encoder_state = tuple(tf.nn.rnn_cell.LSTMStateTuple(final_avg_for_func, final_avg_for_func) for _ in
                                    range(self.config.NUM_DECODER_LAYERS))
+        batched_contexts_reshape = tf.reshape(batched_contexts,
+                                              [-1, self.config.MAX_CONTEXTS, self.config.DECODER_SIZE])
+        # END OF MY SUPER-PUPER RNN
         projection_layer = tf.layers.Dense(self.target_vocab_size, use_bias=False)
         if is_evaluating and self.config.BEAM_WIDTH > 0:
             batched_contexts = tf.contrib.seq2seq.tile_batch(batched_contexts, multiplier=self.config.BEAM_WIDTH)
@@ -392,11 +454,12 @@ class Model:
                                                                      multiplier=self.config.BEAM_WIDTH)
         attention_mechanism = tf.contrib.seq2seq.LuongAttention(
             num_units=self.config.DECODER_SIZE,
-            memory=batched_contexts
+            memory=batched_contexts_reshape  # (batch * func, max_contexts, decoder_size)
         )
         # TF doesn't support beam search with alignment history
         should_save_alignment_history = is_evaluating and self.config.BEAM_WIDTH == 0
-        decoder_cell = tf.contrib.seq2seq.AttentionWrapper(decoder_cell, attention_mechanism,
+        decoder_cell = tf.contrib.seq2seq.AttentionWrapper(decoder_cell,
+                                                           attention_mechanism,
                                                            attention_layer_size=self.config.DECODER_SIZE,
                                                            alignment_history=should_save_alignment_history)
         if is_evaluating:
@@ -417,7 +480,9 @@ class Model:
             else:
                 helper = tf.contrib.seq2seq.GreedyEmbeddingHelper(target_words_vocab, start_fill, 0)
                 initial_state = decoder_cell.zero_state(batch_size, tf.float32).clone(cell_state=fake_encoder_state)
-                decoder = tf.contrib.seq2seq.BasicDecoder(cell=decoder_cell, helper=helper, initial_state=initial_state,
+                decoder = tf.contrib.seq2seq.BasicDecoder(cell=decoder_cell,
+                                                          helper=helper,
+                                                          initial_state=initial_state,
                                                           output_layer=projection_layer)
 
         else:
@@ -432,7 +497,9 @@ class Model:
 
             initial_state = decoder_cell.zero_state(batch_size, tf.float32).clone(cell_state=fake_encoder_state)
 
-            decoder = tf.contrib.seq2seq.BasicDecoder(cell=decoder_cell, helper=helper, initial_state=initial_state,
+            decoder = tf.contrib.seq2seq.BasicDecoder(cell=decoder_cell,
+                                                      helper=helper,
+                                                      initial_state=initial_state,
                                                       output_layer=projection_layer)
         outputs, final_states, final_sequence_lengths = tf.contrib.seq2seq.dynamic_decode(decoder,
                                                                                           maximum_iterations=self.config.MAX_TARGET_PARTS + 1)
@@ -446,11 +513,13 @@ class Model:
         # path_length:          (batch, max_contexts)
         # valid_contexts_mask:  (batch, max_contexts)
         max_contexts = tf.shape(path_embed)[1]
+
+        # (batch * func * max_contexts, max_path_length+1, dim)
         flat_paths = tf.reshape(path_embed, shape=[-1, self.config.MAX_PATH_LENGTH,
-                                                   self.config.EMBEDDINGS_SIZE])  # (batch * max_contexts, max_path_length+1, dim)
-        flat_valid_contexts_mask = tf.reshape(valid_contexts_mask, [-1])  # (batch * max_contexts)
+                                                   self.config.EMBEDDINGS_SIZE])
+        flat_valid_contexts_mask = tf.reshape(valid_contexts_mask, [-1])  # (batch * func * max_contexts)
         lengths = tf.multiply(tf.reshape(path_lengths, [-1]),
-                              tf.cast(flat_valid_contexts_mask, tf.int32))  # (batch * max_contexts)
+                              tf.cast(flat_valid_contexts_mask, tf.int32))  # (batch * func * max_contexts)
         if self.config.BIRNN:
             rnn_cell_fw = tf.nn.rnn_cell.LSTMCell(self.config.RNN_SIZE / 2)
             rnn_cell_bw = tf.nn.rnn_cell.LSTMCell(self.config.RNN_SIZE / 2)
@@ -459,13 +528,17 @@ class Model:
                                                             output_keep_prob=self.config.RNN_DROPOUT_KEEP_PROB)
                 rnn_cell_bw = tf.nn.rnn_cell.DropoutWrapper(rnn_cell_bw,
                                                             output_keep_prob=self.config.RNN_DROPOUT_KEEP_PROB)
-            _, (state_fw, state_bw) = tf.nn.bidirectional_dynamic_rnn(
+            (out_fw, out_bw), (state_fw, state_bw) = tf.nn.bidirectional_dynamic_rnn(
                 cell_fw=rnn_cell_fw,
                 cell_bw=rnn_cell_bw,
                 inputs=flat_paths,
                 dtype=tf.float32,
                 sequence_length=lengths)
-            final_rnn_state = tf.concat([state_fw.h, state_bw.h], axis=-1)  # (batch * max_contexts, rnn_size)  
+            final_rnn_state = tf.concat([state_fw.h, state_bw.h], axis=-1)  # (batch * func * max_contexts, rnn_size)
+            # assert False
+            assert hasattr(state_fw, "h")
+            assert hasattr(state_fw, "c")
+            assert state_fw.__class__ == state_bw.__class__
         else:
             rnn_cell = tf.nn.rnn_cell.LSTMCell(self.config.RNN_SIZE)
             if not is_evaluating:
@@ -476,42 +549,63 @@ class Model:
                 dtype=tf.float32,
                 sequence_length=lengths
             )
-            final_rnn_state = state.h  # (batch * max_contexts, rnn_size)
+            assert False
 
+            final_rnn_state = state.h  # (batch * func * max_contexts, rnn_size)
+
+
+        # WTF 1111 HARDCODING
         return tf.reshape(final_rnn_state,
-                          shape=[-1, max_contexts, self.config.RNN_SIZE])  # (batch, max_contexts, rnn_size)
+                          shape=[1, -1, max_contexts, self.config.RNN_SIZE])  # (batch=1, func, max_contexts, rnn_size)
 
-    def compute_contexts(self, subtoken_vocab, nodes_vocab, source_input, nodes_input,
-                         target_input, valid_mask, path_source_lengths, path_lengths, path_target_lengths,
+    def compute_contexts(self, subtoken_vocab, nodes_vocab,
+
+                         source_input,
+                         nodes_input,
+                         target_input,
+                         valid_mask,
+                         path_source_lengths,
+                         path_lengths,
+                         path_target_lengths,
                          is_evaluating=False):
 
         source_word_embed = tf.nn.embedding_lookup(params=subtoken_vocab,
-                                                   ids=source_input)  # (batch, max_contexts, max_name_parts, dim)
+                                                   ids=source_input)  # (batch, func, max_contexts, max_name_parts, dim)
         path_embed = tf.nn.embedding_lookup(params=nodes_vocab,
-                                            ids=nodes_input)  # (batch, max_contexts, max_path_length+1, dim)
+                                            ids=nodes_input)  # (batch, func, max_contexts, max_path_length+1, dim)
         target_word_embed = tf.nn.embedding_lookup(params=subtoken_vocab,
-                                                   ids=target_input)  # (batch, max_contexts, max_name_parts, dim)
+                                                   ids=target_input)  # (batch, func, max_contexts, max_name_parts, dim)
 
-        source_word_mask = tf.expand_dims(
-            tf.sequence_mask(path_source_lengths, maxlen=self.config.MAX_NAME_PARTS, dtype=tf.float32),
-            -1)  # (batch, max_contexts, max_name_parts, 1)
-        target_word_mask = tf.expand_dims(
-            tf.sequence_mask(path_target_lengths, maxlen=self.config.MAX_NAME_PARTS, dtype=tf.float32),
-            -1)  # (batch, max_contexts, max_name_parts, 1)
+        source_word_mask = tf.expand_dims(tf.sequence_mask(path_source_lengths,
+                                                           maxlen=self.config.MAX_NAME_PARTS,
+                                                           dtype=tf.float32),
+                                          -1)  # (batch, func, max_contexts, max_name_parts, 1)
+        target_word_mask = tf.expand_dims(tf.sequence_mask(path_target_lengths,
+                                                           maxlen=self.config.MAX_NAME_PARTS,
+                                                           dtype=tf.float32),
+                                          -1)  # (batch, func, max_contexts, max_name_parts, 1)
 
         source_words_sum = tf.reduce_sum(source_word_embed * source_word_mask,
-                                         axis=2)  # (batch, max_contexts, dim)
-        path_nodes_aggregation = self.calculate_path_abstraction(path_embed, path_lengths, valid_mask,
-                                                                 is_evaluating)  # (batch, max_contexts, rnn_size)
-        target_words_sum = tf.reduce_sum(target_word_embed * target_word_mask, axis=2)  # (batch, max_contexts, dim)
+                                         axis=-2)  # (batch, func, max_contexts, dim)
+        path_nodes_aggregation = self.calculate_path_abstraction(path_embed,
+                                                                 path_lengths,
+                                                                 valid_mask,
+                                                                 is_evaluating)  # (batch, func, max_contexts, rnn_size)
+        target_words_sum = tf.reduce_sum(target_word_embed * target_word_mask,
+                                         axis=-2)  # (batch, func, max_contexts, dim)
 
         context_embed = tf.concat([source_words_sum, path_nodes_aggregation, target_words_sum],
-                                  axis=-1)  # (batch, max_contexts, dim * 2 + rnn_size)
+                                  axis=-1)  # (batch, func, max_contexts, dim * 2 + rnn_size)
+
         if not is_evaluating:
             context_embed = tf.nn.dropout(context_embed, self.config.EMBEDDINGS_DROPOUT_KEEP_PROB)
 
-        batched_embed = tf.layers.dense(inputs=context_embed, units=self.config.DECODER_SIZE,
-                                        activation=tf.nn.tanh, trainable=not is_evaluating, use_bias=False)
+        # (batch, func, max_contexts, decoder_size)
+        batched_embed = tf.layers.dense(inputs=context_embed,
+                                        units=self.config.DECODER_SIZE,
+                                        activation=tf.nn.tanh,
+                                        trainable=not is_evaluating,
+                                        use_bias=False)
 
         return batched_embed
 
